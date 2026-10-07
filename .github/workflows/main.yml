@@ -9,259 +9,535 @@ jobs:
     timeout-minutes: 3600
 
     steps:
-      - name: Fast Windows 11 Cleanup and Optimization
+      - name: Create RDP User
         shell: powershell
         run: |
-          $ErrorActionPreference = "SilentlyContinue"
+          $ErrorActionPreference = "Stop"
+          $password = "Mr.Sukuna99"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          $existing = Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+          if (-not $existing) {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          } else {
+              Set-LocalUser -Name "RDP" -Password $securePass
+              Enable-LocalUser -Name "RDP"
+          }
+
+          foreach ($group in @("Administrators", "Remote Desktop Users")) {
+              if (-not (Get-LocalGroupMember -Group $group -Member "RDP" -ErrorAction SilentlyContinue)) {
+                  Add-LocalGroupMember -Group $group -Member "RDP"
+              }
+          }
+
+          "RDP_CREDS=User: RDP | Password: $password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "RDP user ready."
+
+      - name: Deep Windows Server 2025 Cleanup
+        shell: powershell
+        timeout-minutes: 20
+        run: |
+          $ErrorActionPreference = "Continue"
+          $ProgressPreference = "SilentlyContinue"
+
+          Write-Host "==============================================="
+          Write-Host " DEEP WINDOWS SERVER 2025 RDP CLEANUP"
+          Write-Host "==============================================="
+
           $before = (Get-PSDrive C).Free
 
-          Write-Host "========================================"
-          Write-Host " WINDOWS 11 FAST CLEANUP + OPTIMIZATION"
-          Write-Host "========================================"
-
-          # Keep the useful runtime/tooling needed by this RDP workflow:
-          # Chrome, Git, Node.js, PowerShell, 7-Zip, Tailscale and Windows core components.
-          # Remove only clearly unnecessary preinstalled developer/database/browser apps.
-          $patterns = @(
-            "Rtools*",
-            "Microsoft Edge*",
-            "Mozilla Firefox*",
-            "Mozilla Maintenance Service*",
-            "Unity Hub*",
-            "Azure Cosmos DB Emulator*",
-            "Microsoft Azure Service Fabric*",
-            "Windows Software Development Kit*",
-            "Windows SDK AddOn*",
-            "Windows Driver Kit*",
-            "MongoDB*",
-            "PostgreSQL*",
-            "MySQL Server*",
-            "Microsoft SQL Server Integration Services Projects*",
-            "Microsoft SQL Server Data-Tier Application Framework*",
-            "Microsoft SQL Server 2025 LocalDB*",
-            "PowerShell Extensions for SQL Server*",
-            "AWS Command Line Interface*",
-            "AWS SAM Command Line Interface*",
-            "AWS SAM Command Line Interface*",
-            "Mercurial*",
-            "TortoiseSVN*",
-            "sbt*",
-            "Strawberry Perl*",
-            "ImageMagick*",
-            "IIS Express*",
-            "GitHub CLI*",
-            "Microsoft Web Platform Installer*",
-            "Inno Setup*",
-            "Epic Online Services*"
+          # These are the large developer/database/browser components from the GitHub image
+          # that are not needed for this RDP + Chrome + FDM use case.
+          $targetRegex = @(
+            '^Rtools',
+            '^Microsoft Edge$',
+            '^Mozilla Firefox',
+            '^Mozilla Maintenance Service',
+            '^Unity Hub',
+            '^Azure Cosmos DB Emulator',
+            '^Microsoft Azure Service Fabric',
+            '^Windows Software Development Kit',
+            '^Windows SDK AddOn',
+            '^Windows Driver Kit',
+            '^MongoDB',
+            '^PostgreSQL',
+            '^MySQL Server',
+            '^Microsoft SQL Server Integration Services Projects',
+            '^Microsoft SQL Server Data-Tier Application Framework',
+            '^Microsoft SQL Server 2025 LocalDB',
+            '^PowerShell Extensions for SQL Server',
+            '^AWS Command Line Interface',
+            '^AWS SAM Command Line Interface',
+            '^Mercurial',
+            '^TortoiseSVN',
+            '^sbt',
+            '^Strawberry Perl',
+            '^ImageMagick',
+            '^IIS Express',
+            '^GitHub CLI',
+            '^Microsoft Web Platform Installer',
+            '^Inno Setup',
+            '^Epic Online Services'
           )
 
-          # Never target these, even if a broad pattern matches something nearby.
-          $protected = @(
-            "Google Chrome*",
-            "Microsoft Edge WebView2 Runtime*",
-            "Git*",
-            "Node.js*",
-            "PowerShell*",
-            "7-Zip*",
-            "Tailscale*"
+          function IsTarget([string]$name) {
+              if ([string]::IsNullOrWhiteSpace($name)) { return $false }
+              foreach ($rx in $targetRegex) {
+                  if ($name -match $rx) { return $true }
+              }
+              return $false
+          }
+
+          function IsProtected([string]$name) {
+              # Explicitly preserve the apps/tools we want.
+              return $name -match '^(Google Chrome|Microsoft Edge WebView2 Runtime|Git$|Node\.js|PowerShell|7-Zip|Tailscale)'
+          }
+
+          # Stop processes that commonly block their own uninstallers.
+          $processNames = @(
+            'msedge','firefox','UnityHub','mongod','mongo','postgres','postgresql','mysqld',
+            'CosmosDb.Emulator','ServiceFabric','FDM','fdm','fdmhost','gh'
+          )
+          foreach ($p in $processNames) {
+              Get-Process -Name $p -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          }
+
+          # ------------------------------------------------------------
+          # 1) Chocolatey cleanup where the image package is Chocolatey-managed.
+          # ------------------------------------------------------------
+          $choco = Get-Command choco.exe -ErrorAction SilentlyContinue
+          if ($choco) {
+              Write-Host "Scanning Chocolatey packages..."
+              $lines = @(& $choco.Source list --local-only --limit-output 2>$null)
+              foreach ($line in $lines) {
+                  if ($line -notmatch '\|') { continue }
+                  $pkg = ($line -split '\|',2)[0]
+                  if ($pkg -and (IsTarget $pkg)) {
+                      Write-Host "Chocolatey remove: $pkg"
+                      & $choco.Source uninstall $pkg -y --no-progress --limit-output 2>&1 | ForEach-Object { Write-Host $_ }
+                  }
+              }
+          }
+
+          # ------------------------------------------------------------
+          # 2) AppX/UWP consumer packages.
+          # ------------------------------------------------------------
+          $appxPatterns = @(
+            '^Microsoft\.WindowsFeedbackHub$',
+            '^Microsoft\.GetHelp$',
+            '^Microsoft\.Getstarted$',
+            '^Microsoft\.BingNews$',
+            '^Microsoft\.BingWeather$',
+            '^Microsoft\.People$',
+            '^Microsoft\.Todos$',
+            '^Microsoft\.Xbox',
+            '^Microsoft\.GamingApp$',
+            '^MicrosoftWindows\.Client\.WebExperience$'
           )
 
+          $appx = Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue | Where-Object {
+              $n = [string]$_.Name
+              $n -and ($appxPatterns | Where-Object { $n -match $_ })
+          }
+          foreach ($pkg in ($appx | Sort-Object Name -Unique)) {
+              Write-Host "AppX remove: $($pkg.Name)"
+              try {
+                  Remove-AppxPackage -Package $pkg.PackageFullName -AllUsers -ErrorAction Continue
+              } catch { Write-Warning "AppX removal failed: $($pkg.Name)" }
+          }
+
+          $prov = Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Where-Object {
+              $n = [string]$_.DisplayName
+              $n -and ($appxPatterns | Where-Object { $n -match $_ })
+          }
+          foreach ($pkg in ($prov | Sort-Object DisplayName -Unique)) {
+              Write-Host "Provisioned AppX remove: $($pkg.DisplayName)"
+              Remove-AppxProvisionedPackage -Online -PackageName $pkg.PackageName -ErrorAction Continue | Out-Null
+          }
+
+          # ------------------------------------------------------------
+          # 3) Registry uninstall entries, using QuietUninstallString first.
+          #    The old script stopped each installer after ~30 sec. That was
+          #    the main reason many entries survived or remained in a queue.
+          # ------------------------------------------------------------
           $roots = @(
-            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
-            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
           )
 
-          $apps = foreach ($root in $roots) {
-            Get-ItemProperty $root -ErrorAction SilentlyContinue |
-              Where-Object {
-                $n = [string]$_.DisplayName
-                $n -and ($patterns | Where-Object { $n -like $_ }) -and -not ($protected | Where-Object { $n -like $_ })
-              }
+          $entries = foreach ($root in $roots) {
+              Get-ItemProperty $root -ErrorAction SilentlyContinue
           }
 
-          $apps = $apps | Where-Object { $_.UninstallString } | Sort-Object DisplayName -Unique
+          $apps = $entries |
+            Where-Object {
+              $name = [string]$_.DisplayName
+              $name -and (IsTarget $name) -and -not (IsProtected $name)
+            } |
+            Sort-Object DisplayName, PSPath -Unique
 
-          function Invoke-Uninstaller($app) {
-            $u = [string]$app.UninstallString
-            Write-Host "Removing: $($app.DisplayName)"
+          function Invoke-RegistryUninstall($app) {
+              $name = [string]$app.DisplayName
+              $cmd  = [string]$app.QuietUninstallString
+              if (-not $cmd) { $cmd = [string]$app.UninstallString }
+              if (-not $cmd) {
+                  Write-Warning "No uninstall command: $name"
+                  return
+              }
 
-            if ($u -match '(?i)msiexec(?:\.exe)?' -and $u -match '\{[0-9A-Fa-f-]{36}\}') {
-              $code = $Matches[0]
-              $proc = Start-Process "$env:WINDIR\System32\msiexec.exe" `
-                -ArgumentList @('/x',$code,'/qn','/norestart') -PassThru -WindowStyle Hidden
-              if ($proc.WaitForExit(30000)) {
-                Write-Host "  MSI exit code: $($proc.ExitCode)"
+              Write-Host "Registry uninstall: $name"
+
+              $guid = $null
+              if ($cmd -match '(?i)\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}') {
+                  $guid = $Matches[0]
+              }
+
+              if ($guid) {
+                  $p = Start-Process -FilePath "$env:WINDIR\System32\msiexec.exe" `
+                      -ArgumentList @('/x',$guid,'/qn','/norestart','REBOOT=ReallySuppress') `
+                      -PassThru -WindowStyle Hidden
               } else {
-                Write-Host "  Still running after 30s; leaving installer alone and continuing."
+                  # Run the exact vendor-provided uninstall command through cmd.exe.
+                  $p = Start-Process -FilePath "$env:ComSpec" `
+                      -ArgumentList @('/d','/s','/c',$cmd) `
+                      -PassThru -WindowStyle Hidden
               }
-              return
-            }
 
-            # Handle common EXE uninstallers without inventing silent switches.
-            # If the vendor string already contains quiet switches, preserve them.
-            if ($u -match '^\s*"([^"]+)"\s*(.*)$') {
-              $exe=$Matches[1]; $args=$Matches[2]
-            } elseif ($u -match '^\s*([^\s]+)\s*(.*)$') {
-              $exe=$Matches[1]; $args=$Matches[2]
-            } else { return }
-
-            if (Test-Path $exe) {
-              $proc=Start-Process -FilePath $exe -ArgumentList $args -PassThru -WindowStyle Hidden
-              if ($proc.WaitForExit(30000)) { Write-Host "  Exit code: $($proc.ExitCode)" }
-              else { Write-Host "  Still running after 30s; continuing." }
-            }
+              if ($p.WaitForExit(120000)) {
+                  Write-Host "  Exit code: $($p.ExitCode)"
+              } else {
+                  Write-Warning "  $name still running after 120s; leaving it alone and continuing."
+              }
           }
 
-          foreach ($app in $apps) { Invoke-Uninstaller $app }
+          foreach ($app in $apps) {
+              Invoke-RegistryUninstall $app
+          }
 
-          # Remove common per-user bloat left by removed apps.
+          # ------------------------------------------------------------
+          # 4) Edge has a dedicated setup uninstaller on the image.
+          #    WebView2 is deliberately NOT touched.
+          # ------------------------------------------------------------
+          $edgeSetups = Get-ChildItem 'C:\Program Files (x86)\Microsoft\Edge\Application\*\Installer\setup.exe' -ErrorAction SilentlyContinue
+          foreach ($setup in $edgeSetups) {
+              Write-Host "Edge dedicated uninstall: $($setup.FullName)"
+              $p = Start-Process -FilePath $setup.FullName `
+                  -ArgumentList @('--uninstall','--system-level','--force-uninstall','--verbose-logging') `
+                  -PassThru -WindowStyle Hidden
+              if (-not $p.WaitForExit(120000)) {
+                  Write-Warning "Edge uninstaller exceeded 120s. Continuing."
+              }
+          }
+
+          # ------------------------------------------------------------
+          # 5) Delete only residual folders belonging to the explicitly
+          #    unwanted programs. Do NOT delete WebView2, Git, Chrome,
+          #    Node.js, PowerShell, 7-Zip or Tailscale.
+          # ------------------------------------------------------------
+          $residualPaths = @(
+            'C:\Program Files\Mozilla Firefox',
+            'C:\Program Files (x86)\Mozilla Firefox',
+            'C:\Program Files\Unity Hub',
+            'C:\Program Files (x86)\Unity Hub',
+            'C:\Program Files\PostgreSQL',
+            'C:\Program Files\MongoDB',
+            'C:\Program Files\MySQL',
+            'C:\Program Files\TortoiseSVN',
+            'C:\Program Files\IIS Express',
+            'C:\Program Files\GitHub CLI',
+            'C:\Program Files\Amazon\AWSCLIV2',
+            'C:\Program Files\Amazon\AWSSAMCLI',
+            'C:\Strawberry',
+            'C:\Program Files\Inno Setup 6',
+            'C:\Program Files (x86)\Inno Setup 6'
+          )
+          foreach ($path in $residualPaths) {
+              if (Test-Path $path) {
+                  Write-Host "Residual folder remove: $path"
+                  Remove-Item $path -Recurse -Force -ErrorAction SilentlyContinue
+              }
+          }
+
+          # Rtools uses versioned folders on runner images.
+          Get-ChildItem 'C:\' -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^rtools\d+$' } |
+            ForEach-Object {
+              Write-Host "Residual Rtools folder remove: $($_.FullName)"
+              Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            }
+
+          # Windows SDK/WDK are installed under Windows Kits on this runner image.
+          # This is a disposable RDP VM, so remove the kits after their uninstallers run.
+          $kitsPaths = @(
+            'C:\Program Files (x86)\Windows Kits\10',
+            'C:\Program Files (x86)\Windows Kits\11'
+          )
+          foreach ($path in $kitsPaths) {
+              if (Test-Path $path) {
+                  Write-Host "Windows Kits residual cleanup: $path"
+                  Remove-Item $path -Recurse -Force -ErrorAction SilentlyContinue
+              }
+          }
+
+          # ------------------------------------------------------------
+          # 6) Remove stale uninstall entries only when their install path
+          #    is gone. This prevents ghost entries in Apps & Features.
+          # ------------------------------------------------------------
+          foreach ($app in $apps) {
+              $name = [string]$app.DisplayName
+              $loc  = [string]$app.InstallLocation
+              if ($loc -and -not (Test-Path $loc)) {
+                  try {
+                      Remove-Item -Path $app.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+                      Write-Host "Removed stale uninstall entry: $name"
+                  } catch { }
+              }
+          }
+
+          # Temp/cache cleanup after uninstallers have finished.
           Remove-Item "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item "$env:WINDIR\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
           Clear-RecycleBin -DriveLetter C -Force -ErrorAction SilentlyContinue
 
-          # Windows 11 performance profile for a disposable VM/RDP session.
+          $after = (Get-PSDrive C).Free
+          Write-Host ("Free space: {0:N2} GB" -f ($after/1GB))
+          Write-Host ("Space recovered: {0:N2} GB" -f (($after-$before)/1GB))
+
+          Write-Host "Remaining targeted uninstall entries:"
+          foreach ($e in ($entries | Where-Object { IsTarget ([string]$_.DisplayName) -and -not (IsProtected ([string]$_.DisplayName)) } | Sort-Object DisplayName -Unique)) {
+              Write-Host ("  {0} | InstallLocation={1}" -f $e.DisplayName,$e.InstallLocation)
+          }
+
+      - name: Apply Real Windows Performance Settings
+        shell: powershell
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          Write-Host "==============================================="
+          Write-Host " WINDOWS PERFORMANCE + RDP VISUAL OPTIMIZATION"
+          Write-Host "==============================================="
+
+          # High-performance power plan. RDP runner is disposable, so battery-saving logic is pointless here.
           powercfg /setactive SCHEME_MIN
           powercfg /hibernate off
+          powercfg /change standby-timeout-ac 0
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change disk-timeout-ac 0
+          powercfg /change hibernate-timeout-ac 0
 
-          # Visual effects: prioritize responsiveness over animations/transparency.
-          $adv = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects'
-          New-Item $adv -Force | Out-Null
-          Set-ItemProperty $adv -Name VisualFXSetting -Type DWord -Value 2 -Force
-          Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name UserPreferencesMask -Type Binary `
-            -Value ([byte[]](0x90,0x12,0x03,0x80,0x10,0x00,0x00,0x00)) -Force
-          Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Name EnableTransparency -Type DWord -Value 0 -Force
+          # Machine policy: turn off window animations. Microsoft documents this as the
+          # DWM DisallowAnimations policy for Windows 11 and later.
+          New-Item 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DWM' -Force | Out-Null
+          Set-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DWM' `
+            -Name DisallowAnimations -Type DWord -Value 1 -Force
 
-          # RDP visual settings: reduce graphics/network overhead.
-          $rdp='HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
-          New-Item $rdp -Force | Out-Null
-          Set-ItemProperty $rdp -Name fDisableWallpaper -Type DWord -Value 1 -Force
-          Set-ItemProperty $rdp -Name fDisableFullWindowDrag -Type DWord -Value 1 -Force
-          Set-ItemProperty $rdp -Name fDisableMenuAnims -Type DWord -Value 1 -Force
-          Set-ItemProperty $rdp -Name fDisableThemes -Type DWord -Value 1 -Force
-          Set-ItemProperty $rdp -Name fEnableTimeZoneRedirection -Type DWord -Value 1 -Force
-
-          # Disable services that provide little value on a disposable RDP VM.
-          # Do NOT disable Windows Update, Defender, RPC, TermService, or networking.
-          foreach ($svc in @('SysMain','WSearch','DiagTrack')) {
-            Stop-Service $svc -Force -ErrorAction SilentlyContinue
-            Set-Service $svc -StartupType Disabled -ErrorAction SilentlyContinue
+          # RDP session visual effects: wallpaper, full-window drag, menu animations and themes off.
+          $rdpPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          New-Item $rdpPolicy -Force | Out-Null
+          $rdpValues = @{
+            fDisableWallpaper = 1
+            fDisableFullWindowDrag = 1
+            fDisableMenuAnims = 1
+            fDisableThemes = 1
+            fEnableTimeZoneRedirection = 1
+          }
+          foreach ($pair in $rdpValues.GetEnumerator()) {
+              Set-ItemProperty $rdpPolicy -Name $pair.Key -Type DWord -Value $pair.Value -Force
           }
 
-          # Reduce background consumer features on Windows 11.
+          # Keep WDDM enabled. Microsoft currently documents WDDM as the normal RDP display driver path;
+          # do not disable it just for the sake of a benchmark.
+          Set-ItemProperty $rdpPolicy -Name fEnableWddmDriver -Type DWord -Value 1 -Force
+
+          # Force-deny background UWP app execution at the device level.
+          New-Item 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy' -Force | Out-Null
+          Set-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy' `
+            -Name LetAppsRunInBackground -Type DWord -Value 2 -Force
+
+          # Disable Widgets policy where supported.
+          New-Item 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' -Force | Out-Null
+          Set-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' `
+            -Name AllowNewsAndInterests -Type DWord -Value 0 -Force
+          Set-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' `
+            -Name DisableWidgetsBoard -Type DWord -Value 1 -Force
+
+          # Chrome: do not keep a background process or Startup Boost running when the browser is closed.
+          New-Item 'HKLM:\SOFTWARE\Policies\Google\Chrome' -Force | Out-Null
+          Set-ItemProperty 'HKLM:\SOFTWARE\Policies\Google\Chrome' -Name BackgroundModeEnabled -Type DWord -Value 0 -Force
+          Set-ItemProperty 'HKLM:\SOFTWARE\Policies\Google\Chrome' -Name StartupBoostEnabled -Type DWord -Value 0 -Force
+
+          # Stop services that are mostly noise on a disposable RDP runner.
+          $services = @(
+            'SysMain',
+            'WSearch',
+            'DiagTrack',
+            'MapsBroker',
+            'RetailDemo',
+            'Fax',
+            'XblAuthManager',
+            'XblGameSave',
+            'XboxNetApiSvc',
+            'XboxGipSvc'
+          )
+          foreach ($svc in $services) {
+              Stop-Service $svc -Force -ErrorAction SilentlyContinue
+              Set-Service $svc -StartupType Disabled -ErrorAction SilentlyContinue
+          }
+
+          # Consumer-features policy.
           New-Item 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' -Force | Out-Null
-          Set-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' -Name DisableWindowsConsumerFeatures -Type DWord -Value 1 -Force
+          Set-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' `
+            -Name DisableWindowsConsumerFeatures -Type DWord -Value 1 -Force
 
-          # Component store cleanup.
+          # Apply performance-oriented defaults to the Default user profile so the RDP user gets them.
+          $defaultHive = 'C:\Users\Default\NTUSER.DAT'
+          $loadedDefault = $false
+          if (Test-Path $defaultHive) {
+              & reg.exe load HKU\RDPDefault "$defaultHive" 2>$null | Out-Null
+              if ($LASTEXITCODE -eq 0) {
+                  $loadedDefault = $true
+                  & reg.exe add 'HKU\RDPDefault\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' /v VisualFXSetting /t REG_DWORD /d 2 /f | Out-Null
+                  & reg.exe add 'HKU\RDPDefault\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' /v EnableTransparency /t REG_DWORD /d 0 /f | Out-Null
+                  & reg.exe add 'HKU\RDPDefault\Software\Microsoft\Windows\DWM' /v EnableAeroPeek /t REG_DWORD /d 0 /f | Out-Null
+                  & reg.exe add 'HKU\RDPDefault\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' /v TaskbarAnimations /t REG_DWORD /d 0 /f | Out-Null
+                  & reg.exe add 'HKU\RDPDefault\Control Panel\Desktop' /v MenuShowDelay /t REG_SZ /d 0 /f | Out-Null
+                  & reg.exe add 'HKU\RDPDefault\Control Panel\Desktop' /v DragFullWindows /t REG_SZ /d 0 /f | Out-Null
+                  & reg.exe add 'HKU\RDPDefault\Control Panel\Desktop' /v MinAnimate /t REG_SZ /d 0 /f | Out-Null
+                  & reg.exe add 'HKU\RDPDefault\Software\Policies\Microsoft\Windows\DWM' /v DisallowAnimations /t REG_DWORD /d 1 /f | Out-Null
+                  & reg.exe unload HKU\RDPDefault | Out-Null
+              }
+          }
+
+          # Build a logon script that re-applies per-user settings in the actual RDP session.
+          $userScript = 'C:\ProgramData\RDP-UserPerformance.ps1'
+          @'
+          $ErrorActionPreference = "SilentlyContinue"
+          New-Item 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' -Force | Out-Null
+          Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' -Name VisualFXSetting -Type DWord -Value 2 -Force
+          New-Item 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Force | Out-Null
+          Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Name EnableTransparency -Type DWord -Value 0 -Force
+          New-Item 'HKCU:\Software\Microsoft\Windows\DWM' -Force | Out-Null
+          Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\DWM' -Name EnableAeroPeek -Type DWord -Value 0 -Force
+          New-Item 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Force | Out-Null
+          Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' -Name TaskbarAnimations -Type DWord -Value 0 -Force
+          Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name MenuShowDelay -Type String -Value 0 -Force
+          Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name DragFullWindows -Type String -Value 0 -Force
+          Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name MinAnimate -Type String -Value 0 -Force
+          New-Item 'HKCU:\Software\Policies\Microsoft\Windows\DWM' -Force | Out-Null
+          Set-ItemProperty 'HKCU:\Software\Policies\Microsoft\Windows\DWM' -Name DisallowAnimations -Type DWord -Value 1 -Force
+          '@ | Set-Content -Path $userScript -Encoding UTF8
+
+          # Run that script at each RDP user logon, in the RDP user's own HKCU context.
+          $task = 'RDP-User-Performance'
+          schtasks.exe /Delete /TN $task /F 2>$null | Out-Null
+          schtasks.exe /Create /TN $task `
+            /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$userScript`"" `
+            /SC ONLOGON /RU RDP /RP "Mr.Sukuna99" /RL HIGHEST /F | Out-Null
+
+          # Refresh Explorer policies for the current service account where possible.
+          Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+
+          Write-Host "Performance settings applied."
+          Write-Host "Default user profile: $loadedDefault"
+
+      - name: DISM and Temp Cleanup
+        shell: powershell
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = "Continue"
           DISM.exe /Online /Cleanup-Image /StartComponentCleanup /Quiet
-
-          $after = (Get-PSDrive C).Free
-          Write-Host ("Free space after cleanup: {0:N2} GB" -f ($after/1GB))
-          Write-Host ("Space recovered: {0:N2} GB" -f (($after-$before)/1GB))
-          Write-Host "Windows 11 optimization completed."
+          Remove-Item "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "$env:WINDIR\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
+          Clear-RecycleBin -DriveLetter C -Force -ErrorAction SilentlyContinue
 
       - name: Configure Core RDP Settings
+        shell: powershell
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          $ErrorActionPreference = "Stop"
+
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
+            -Name fDenyTSConnections -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
+            -Name UserAuthentication -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
+            -Name SecurityLayer -Value 0 -Force
 
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          
-          # For testing, allow any incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 | Out-Null
 
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
-
-      - name: Create RDP User with Secure Password
-        run: |
-          $password = "Mr.Sukuna99"
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-          
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
-              exit 1
-          }
+          Write-Host "RDP enabled and TermService restarted."
 
       - name: Install Tailscale
+        shell: powershell
         run: |
+          $ErrorActionPreference = "Stop"
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-          
+
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          Start-Process msiexec.exe -ArgumentList @('/i',$installerPath,'/quiet','/norestart') -Wait
+          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
 
       - name: Establish Tailscale Connection
+        shell: powershell
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          
-          # Wait for Tailscale to assign an IP
+          $ErrorActionPreference = "Stop"
+          $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $exe up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+
           $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
+          for ($i = 0; $i -lt 20 -and -not $tsIP; $i++) {
+              $tsIP = (& $exe ip -4 2>$null | Select-Object -First 1).Trim()
+              if (-not $tsIP) { Start-Sleep -Seconds 3 }
           }
-          
+
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
+              Write-Error "Tailscale IP not assigned."
               exit 1
           }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-      
+
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Tailscale IPv4: $tsIP"
+
       - name: Verify RDP Accessibility
+        shell: powershell
         run: |
+          $ErrorActionPreference = "Stop"
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
+          $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $test.TcpTestSucceeded) {
+              Write-Error "TCP 3389 test failed."
               exit 1
           }
-          Write-Host "TCP connectivity successful!"
+          Write-Host "TCP 3389 is reachable."
 
       - name: Install Free Download Manager
         shell: powershell
         continue-on-error: true
+        timeout-minutes: 5
         run: |
           $ErrorActionPreference = "Stop"
           $ProgressPreference = "SilentlyContinue"
           $url = "https://files2.freedownloadmanager.org/6/latest/fdm_x64_setup.exe"
           $installer = "$env:TEMP\fdm_x64_setup.exe"
 
-          $sw = [Diagnostics.Stopwatch]::StartNew()
           curl.exe -L --fail --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 180 -o "$installer" "$url"
-          $sw.Stop()
-
           if (-not (Test-Path $installer) -or (Get-Item $installer).Length -lt 5MB) {
-            throw "FDM installer download failed or is unexpectedly small."
+              throw "FDM installer download failed or is unexpectedly small."
           }
-          Write-Host ("FDM download: {0:N2} MB in {1:N1} seconds" -f ((Get-Item $installer).Length/1MB), $sw.Elapsed.TotalSeconds)
 
-          $sw.Restart()
-          $proc = Start-Process -FilePath $installer -ArgumentList "/SP-", "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -PassThru
+          Write-Host ("FDM installer: {0:N2} MB" -f ((Get-Item $installer).Length/1MB))
+          $proc = Start-Process -FilePath $installer `
+            -ArgumentList @('/SP-','/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART') -PassThru
+
           if (-not $proc.WaitForExit(120000)) {
-            Write-Warning "FDM installer exceeded 120 seconds. Terminating and continuing."
-            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-            Get-Process fdm* -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+              Write-Warning "FDM installer exceeded 120 seconds. Terminating only the installer process."
+              Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
           }
-          $sw.Stop()
-          Write-Host ("FDM install phase: {0:N1} seconds" -f $sw.Elapsed.TotalSeconds)
+
           Remove-Item $installer -Force -ErrorAction SilentlyContinue
 
       - name: Configure FDM Chrome Extension
@@ -273,36 +549,66 @@ jobs:
             "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
             "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
           ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $chrome) { Write-Warning "Chrome not found; skipping FDM extension policy."; exit 0 }
+          if (-not $chrome) { Write-Warning "Chrome not found; skipping extension policy."; exit 0 }
 
+          # FDM's official site states its browser extension is required for the best browser integration.
+          # Install only the extension; do not create a second download pathway in Chrome.
           $extensionId = "ahmpjcflkgiildlgicmcieglgoilbfdp"
           $policyPath = 'HKLM:\SOFTWARE\Policies\Google\Chrome'
           New-Item $policyPath -Force | Out-Null
           New-ItemProperty -Path $policyPath -Name ExtensionInstallForcelist -PropertyType MultiString `
             -Value @("$extensionId;https://clients2.google.com/service/update2/crx") -Force | Out-Null
-          Write-Host "FDM Chrome extension policy configured: $extensionId"
 
-      - name: Verify Runner Resources
+          Write-Host "FDM Chrome extension forced: $extensionId"
+
+      - name: Verify Final Resources and Remaining Target Apps
         shell: powershell
         run: |
           $cs = Get-CimInstance Win32_ComputerSystem
           $os = Get-CimInstance Win32_OperatingSystem
-          Write-Host ("CPU cores: {0}" -f $cs.NumberOfLogicalProcessors)
-          Write-Host ("RAM reported by Windows: {0:N2} GB" -f ($cs.TotalPhysicalMemory/1GB))
-          Write-Host ("Free RAM: {0:N2} GB" -f ($os.FreePhysicalMemory/1MB))
+          $ram = $cs.TotalPhysicalMemory / 1GB
+          $free = $os.FreePhysicalMemory / 1MB
+
+          Write-Host "==============================================="
+          Write-Host " FINAL RUNNER CHECK"
+          Write-Host "==============================================="
+          Write-Host ("CPU logical processors: {0}" -f $cs.NumberOfLogicalProcessors)
+          Write-Host ("RAM: {0:N2} GB" -f $ram)
+          Write-Host ("Free RAM: {0:N2} GB" -f $free)
           Write-Host ("OS: {0}" -f $os.Caption)
-          Write-Host "Note: RAM is assigned by GitHub's runner size, not by the workflow script."
+          Write-Host ("Build: {0}" -f $os.BuildNumber)
+          Write-Host ("C: free space: {0:N2} GB" -f ((Get-PSDrive C).Free/1GB))
+
+          $remaining = Get-ItemProperty @(
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+          ) -ErrorAction SilentlyContinue |
+            Where-Object {
+              $n=[string]$_.DisplayName
+              $n -and $n -match '^(Rtools|Microsoft Edge$|Mozilla Firefox|Mozilla Maintenance Service|Unity Hub|Azure Cosmos DB Emulator|Microsoft Azure Service Fabric|Windows Software Development Kit|Windows SDK AddOn|Windows Driver Kit|MongoDB|PostgreSQL|MySQL Server|Microsoft SQL Server Integration Services Projects|Microsoft SQL Server Data-Tier Application Framework|Microsoft SQL Server 2025 LocalDB|PowerShell Extensions for SQL Server|AWS Command Line Interface|AWS SAM Command Line Interface|Mercurial|TortoiseSVN|sbt|Strawberry Perl|ImageMagick|IIS Express|GitHub CLI|Microsoft Web Platform Installer|Inno Setup|Epic Online Services)'
+            } | Sort-Object DisplayName -Unique
+
+          Write-Host "Remaining targeted app entries:"
+          if (-not $remaining) {
+              Write-Host "  NONE"
+          } else {
+              foreach ($item in $remaining) {
+                  Write-Host ("  {0} | {1}" -f $item.DisplayName,$item.InstallLocation)
+              }
+          }
 
       - name: Maintain Connection
+        shell: powershell
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host ""
+          Write-Host "=== RDP ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP"
           Write-Host "Username: RDP"
           Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
-          
-          # Keep runner active indefinitely (or until manually cancelled)
+          Write-Host "=================="
+          Write-Host ""
+
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Write-Host "[$(Get-Date)] RDP Active - keep-alive"
               Start-Sleep -Seconds 300
           }
