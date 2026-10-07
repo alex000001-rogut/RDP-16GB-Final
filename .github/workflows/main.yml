@@ -20,9 +20,13 @@ jobs:
 
           $before = (Get-PSDrive C).Free
 
-          # Only remove large development/database components that are
-          # unnecessary for this RDP + Tailscale + Chrome + FDM workflow.
-          # Small utilities and Windows dependencies are intentionally left alone.
+          # IMPORTANT:
+          # Do NOT use Win32_Product here. Querying Win32_Product can trigger
+          # MSI consistency checks and is unnecessarily slow.
+          #
+          # Read uninstall entries directly from the registry instead.
+          # These are the large development/database packages visible on the
+          # runner and are not required for this RDP + Tailscale + Chrome + FDM use.
           $targets = @(
             "Rtools*",
             "Microsoft Azure Cosmos DB Emulator*",
@@ -37,44 +41,106 @@ jobs:
             "sbt*"
           )
 
-          $apps = Get-CimInstance Win32_Product -ErrorAction SilentlyContinue |
-            Where-Object {
-              $name = $_.Name
-              $targets | Where-Object { $name -like $_ }
-            }
+          $uninstallRoots = @(
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+          )
 
-          foreach ($app in $apps) {
-            Write-Host "Removing: $($app.Name)"
-
-            # Give each large package a short window and move on.
-            $job = Start-Job -ScriptBlock {
-              param($productCode)
-              $p = Get-CimInstance Win32_Product -Filter "IdentifyingNumber='$productCode'" -ErrorAction SilentlyContinue
-              if ($p) {
-                Invoke-CimMethod -InputObject $p -MethodName Uninstall | Out-Null
+          $entries = foreach ($root in $uninstallRoots) {
+            Get-ItemProperty $root -ErrorAction SilentlyContinue |
+              Where-Object {
+                $name = $_.DisplayName
+                $name -and ($targets | Where-Object { $name -like $_ })
               }
-            } -ArgumentList $app.IdentifyingNumber
-
-            if (Wait-Job $job -Timeout 15) {
-              Receive-Job $job -ErrorAction SilentlyContinue | Out-Null
-              Write-Host "Uninstall attempt finished: $($app.Name)"
-            }
-            else {
-              Stop-Job $job -Force -ErrorAction SilentlyContinue
-              Write-Host "Skipped after 15 seconds: $($app.Name)"
-            }
-
-            Remove-Job $job -Force -ErrorAction SilentlyContinue
           }
 
+          # De-duplicate by display name + uninstall string.
+          $entries = $entries |
+            Where-Object { $_.UninstallString } |
+            Sort-Object DisplayName, UninstallString -Unique
+
+          foreach ($app in $entries) {
+
+            Write-Host ""
+            Write-Host "Removing: $($app.DisplayName)"
+
+            $uninstall = [string]$app.UninstallString
+
+            # MSI packages: invoke msiexec directly. This avoids the
+            # expensive Win32_Product provider.
+            if ($uninstall -match '(?i)msiexec(?:\.exe)?' -and
+                $uninstall -match '\{[0-9A-Fa-f-]{36}\}') {
+
+              $productCode = $Matches[0]
+
+              Write-Host "MSI product: $productCode"
+
+              $proc = Start-Process `
+                -FilePath "$env:WINDIR\System32\msiexec.exe" `
+                -ArgumentList "/x", $productCode, "/qn", "/norestart", "/L*v", "$env:TEMP\uninstall-$($productCode.Trim('{}')).log" `
+                -PassThru
+
+              # Most packages finish well inside this window.
+              # If one takes longer, do NOT kill msiexec. Let it finish
+              # naturally in the background so Windows Installer is not
+              # corrupted. We simply stop waiting for it.
+              if (-not $proc.WaitForExit(45000)) {
+                Write-Host "Still uninstalling after 45 seconds: $($app.DisplayName)"
+                Write-Host "Leaving Windows Installer running safely and continuing."
+              }
+              else {
+                Write-Host "Exit code: $($proc.ExitCode)"
+              }
+
+            }
+            else {
+              # Non-MSI uninstallers are less predictable. Run silently
+              # when their command supports it, with a short bounded wait.
+              Write-Host "Non-MSI uninstaller detected."
+
+              $exe = $null
+              $args = ""
+
+              if ($uninstall -match '^\s*"([^"]+)"\s*(.*)$') {
+                $exe = $Matches[1]
+                $args = $Matches[2]
+              }
+              elseif ($uninstall -match '^\s*([^\s]+)\s*(.*)$') {
+                $exe = $Matches[1]
+                $args = $Matches[2]
+              }
+
+              if ($exe -and (Test-Path $exe)) {
+                $proc = Start-Process `
+                  -FilePath $exe `
+                  -ArgumentList $args `
+                  -PassThru
+
+                if (-not $proc.WaitForExit(30000)) {
+                  Write-Host "Still uninstalling after 30 seconds: $($app.DisplayName)"
+                  Write-Host "Leaving the uninstaller running and continuing."
+                }
+                else {
+                  Write-Host "Exit code: $($proc.ExitCode)"
+                }
+              }
+              else {
+                Write-Host "Could not resolve uninstaller; skipped: $($app.DisplayName)"
+              }
+            }
+          }
+
+          # Safe temporary/cache cleanup.
           Remove-Item "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item "$env:WINDIR\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
           Clear-RecycleBin -DriveLetter C -Force -ErrorAction SilentlyContinue
 
+          # Safe Windows component-store cleanup.
           DISM.exe /Online /Cleanup-Image /StartComponentCleanup /Quiet
 
           $after = (Get-PSDrive C).Free
 
+          Write-Host ""
           Write-Host ("Free space after cleanup: {0:N2} GB" -f ($after / 1GB))
           Write-Host ("Space change: {0:N2} GB" -f (($after - $before) / 1GB))
           Write-Host "Fast cleanup completed."
