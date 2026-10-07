@@ -9,141 +9,155 @@ jobs:
     timeout-minutes: 3600
 
     steps:
-      - name: Fast Cleanup of Large Unneeded Apps
+      - name: Fast Windows 11 Cleanup and Optimization
         shell: powershell
         run: |
           $ErrorActionPreference = "SilentlyContinue"
-
-          Write-Host "========================================"
-          Write-Host " FAST CLEANUP"
-          Write-Host "========================================"
-
           $before = (Get-PSDrive C).Free
 
-          # IMPORTANT:
-          # Do NOT use Win32_Product here. Querying Win32_Product can trigger
-          # MSI consistency checks and is unnecessarily slow.
-          #
-          # Read uninstall entries directly from the registry instead.
-          # These are the large development/database packages visible on the
-          # runner and are not required for this RDP + Tailscale + Chrome + FDM use.
-          $targets = @(
+          Write-Host "========================================"
+          Write-Host " WINDOWS 11 FAST CLEANUP + OPTIMIZATION"
+          Write-Host "========================================"
+
+          # Keep the useful runtime/tooling needed by this RDP workflow:
+          # Chrome, Git, Node.js, PowerShell, 7-Zip, Tailscale and Windows core components.
+          # Remove only clearly unnecessary preinstalled developer/database/browser apps.
+          $patterns = @(
             "Rtools*",
-            "Microsoft Azure Cosmos DB Emulator*",
+            "Microsoft Edge*",
+            "Mozilla Firefox*",
+            "Mozilla Maintenance Service*",
+            "Unity Hub*",
+            "Azure Cosmos DB Emulator*",
+            "Microsoft Azure Service Fabric*",
             "Windows Software Development Kit*",
+            "Windows SDK AddOn*",
             "Windows Driver Kit*",
             "MongoDB*",
             "PostgreSQL*",
             "MySQL Server*",
             "Microsoft SQL Server Integration Services Projects*",
             "Microsoft SQL Server Data-Tier Application Framework*",
-            "Azure Service Fabric*",
-            "sbt*"
+            "Microsoft SQL Server 2025 LocalDB*",
+            "PowerShell Extensions for SQL Server*",
+            "AWS Command Line Interface*",
+            "AWS SAM Command Line Interface*",
+            "AWS SAM Command Line Interface*",
+            "Mercurial*",
+            "TortoiseSVN*",
+            "sbt*",
+            "Strawberry Perl*",
+            "ImageMagick*",
+            "IIS Express*",
+            "GitHub CLI*",
+            "Microsoft Web Platform Installer*",
+            "Inno Setup*",
+            "Epic Online Services*"
           )
 
-          $uninstallRoots = @(
+          # Never target these, even if a broad pattern matches something nearby.
+          $protected = @(
+            "Google Chrome*",
+            "Microsoft Edge WebView2 Runtime*",
+            "Git*",
+            "Node.js*",
+            "PowerShell*",
+            "7-Zip*",
+            "Tailscale*"
+          )
+
+          $roots = @(
             "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
             "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
           )
 
-          $entries = foreach ($root in $uninstallRoots) {
+          $apps = foreach ($root in $roots) {
             Get-ItemProperty $root -ErrorAction SilentlyContinue |
               Where-Object {
-                $name = $_.DisplayName
-                $name -and ($targets | Where-Object { $name -like $_ })
+                $n = [string]$_.DisplayName
+                $n -and ($patterns | Where-Object { $n -like $_ }) -and -not ($protected | Where-Object { $n -like $_ })
               }
           }
 
-          # De-duplicate by display name + uninstall string.
-          $entries = $entries |
-            Where-Object { $_.UninstallString } |
-            Sort-Object DisplayName, UninstallString -Unique
+          $apps = $apps | Where-Object { $_.UninstallString } | Sort-Object DisplayName -Unique
 
-          foreach ($app in $entries) {
-
-            Write-Host ""
+          function Invoke-Uninstaller($app) {
+            $u = [string]$app.UninstallString
             Write-Host "Removing: $($app.DisplayName)"
 
-            $uninstall = [string]$app.UninstallString
-
-            # MSI packages: invoke msiexec directly. This avoids the
-            # expensive Win32_Product provider.
-            if ($uninstall -match '(?i)msiexec(?:\.exe)?' -and
-                $uninstall -match '\{[0-9A-Fa-f-]{36}\}') {
-
-              $productCode = $Matches[0]
-
-              Write-Host "MSI product: $productCode"
-
-              $proc = Start-Process `
-                -FilePath "$env:WINDIR\System32\msiexec.exe" `
-                -ArgumentList "/x", $productCode, "/qn", "/norestart", "/L*v", "$env:TEMP\uninstall-$($productCode.Trim('{}')).log" `
-                -PassThru
-
-              # Most packages finish well inside this window.
-              # If one takes longer, do NOT kill msiexec. Let it finish
-              # naturally in the background so Windows Installer is not
-              # corrupted. We simply stop waiting for it.
-              if (-not $proc.WaitForExit(45000)) {
-                Write-Host "Still uninstalling after 45 seconds: $($app.DisplayName)"
-                Write-Host "Leaving Windows Installer running safely and continuing."
+            if ($u -match '(?i)msiexec(?:\.exe)?' -and $u -match '\{[0-9A-Fa-f-]{36}\}') {
+              $code = $Matches[0]
+              $proc = Start-Process "$env:WINDIR\System32\msiexec.exe" `
+                -ArgumentList @('/x',$code,'/qn','/norestart') -PassThru -WindowStyle Hidden
+              if ($proc.WaitForExit(30000)) {
+                Write-Host "  MSI exit code: $($proc.ExitCode)"
+              } else {
+                Write-Host "  Still running after 30s; leaving installer alone and continuing."
               }
-              else {
-                Write-Host "Exit code: $($proc.ExitCode)"
-              }
-
+              return
             }
-            else {
-              # Non-MSI uninstallers are less predictable. Run silently
-              # when their command supports it, with a short bounded wait.
-              Write-Host "Non-MSI uninstaller detected."
 
-              $exe = $null
-              $args = ""
+            # Handle common EXE uninstallers without inventing silent switches.
+            # If the vendor string already contains quiet switches, preserve them.
+            if ($u -match '^\s*"([^"]+)"\s*(.*)$') {
+              $exe=$Matches[1]; $args=$Matches[2]
+            } elseif ($u -match '^\s*([^\s]+)\s*(.*)$') {
+              $exe=$Matches[1]; $args=$Matches[2]
+            } else { return }
 
-              if ($uninstall -match '^\s*"([^"]+)"\s*(.*)$') {
-                $exe = $Matches[1]
-                $args = $Matches[2]
-              }
-              elseif ($uninstall -match '^\s*([^\s]+)\s*(.*)$') {
-                $exe = $Matches[1]
-                $args = $Matches[2]
-              }
-
-              if ($exe -and (Test-Path $exe)) {
-                $proc = Start-Process `
-                  -FilePath $exe `
-                  -ArgumentList $args `
-                  -PassThru
-
-                if (-not $proc.WaitForExit(30000)) {
-                  Write-Host "Still uninstalling after 30 seconds: $($app.DisplayName)"
-                  Write-Host "Leaving the uninstaller running and continuing."
-                }
-                else {
-                  Write-Host "Exit code: $($proc.ExitCode)"
-                }
-              }
-              else {
-                Write-Host "Could not resolve uninstaller; skipped: $($app.DisplayName)"
-              }
+            if (Test-Path $exe) {
+              $proc=Start-Process -FilePath $exe -ArgumentList $args -PassThru -WindowStyle Hidden
+              if ($proc.WaitForExit(30000)) { Write-Host "  Exit code: $($proc.ExitCode)" }
+              else { Write-Host "  Still running after 30s; continuing." }
             }
           }
 
-          # Safe temporary/cache cleanup.
+          foreach ($app in $apps) { Invoke-Uninstaller $app }
+
+          # Remove common per-user bloat left by removed apps.
           Remove-Item "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item "$env:WINDIR\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
           Clear-RecycleBin -DriveLetter C -Force -ErrorAction SilentlyContinue
 
-          # Safe Windows component-store cleanup.
+          # Windows 11 performance profile for a disposable VM/RDP session.
+          powercfg /setactive SCHEME_MIN
+          powercfg /hibernate off
+
+          # Visual effects: prioritize responsiveness over animations/transparency.
+          $adv = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects'
+          New-Item $adv -Force | Out-Null
+          Set-ItemProperty $adv -Name VisualFXSetting -Type DWord -Value 2 -Force
+          Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name UserPreferencesMask -Type Binary `
+            -Value ([byte[]](0x90,0x12,0x03,0x80,0x10,0x00,0x00,0x00)) -Force
+          Set-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Name EnableTransparency -Type DWord -Value 0 -Force
+
+          # RDP visual settings: reduce graphics/network overhead.
+          $rdp='HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          New-Item $rdp -Force | Out-Null
+          Set-ItemProperty $rdp -Name fDisableWallpaper -Type DWord -Value 1 -Force
+          Set-ItemProperty $rdp -Name fDisableFullWindowDrag -Type DWord -Value 1 -Force
+          Set-ItemProperty $rdp -Name fDisableMenuAnims -Type DWord -Value 1 -Force
+          Set-ItemProperty $rdp -Name fDisableThemes -Type DWord -Value 1 -Force
+          Set-ItemProperty $rdp -Name fEnableTimeZoneRedirection -Type DWord -Value 1 -Force
+
+          # Disable services that provide little value on a disposable RDP VM.
+          # Do NOT disable Windows Update, Defender, RPC, TermService, or networking.
+          foreach ($svc in @('SysMain','WSearch','DiagTrack')) {
+            Stop-Service $svc -Force -ErrorAction SilentlyContinue
+            Set-Service $svc -StartupType Disabled -ErrorAction SilentlyContinue
+          }
+
+          # Reduce background consumer features on Windows 11.
+          New-Item 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' -Force | Out-Null
+          Set-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent' -Name DisableWindowsConsumerFeatures -Type DWord -Value 1 -Force
+
+          # Component store cleanup.
           DISM.exe /Online /Cleanup-Image /StartComponentCleanup /Quiet
 
           $after = (Get-PSDrive C).Free
-
-          Write-Host ""
-          Write-Host ("Free space after cleanup: {0:N2} GB" -f ($after / 1GB))
-          Write-Host ("Space change: {0:N2} GB" -f (($after - $before) / 1GB))
-          Write-Host "Fast cleanup completed."
+          Write-Host ("Free space after cleanup: {0:N2} GB" -f ($after/1GB))
+          Write-Host ("Space recovered: {0:N2} GB" -f (($after-$before)/1GB))
+          Write-Host "Windows 11 optimization completed."
 
       - name: Configure Core RDP Settings
         run: |
@@ -167,19 +181,6 @@ jobs:
 
       - name: Create RDP User with Secure Password
         run: |
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126)) # Special characters
-          }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
           $password = "Mr.Sukuna99"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
@@ -280,6 +281,17 @@ jobs:
           New-ItemProperty -Path $policyPath -Name ExtensionInstallForcelist -PropertyType MultiString `
             -Value @("$extensionId;https://clients2.google.com/service/update2/crx") -Force | Out-Null
           Write-Host "FDM Chrome extension policy configured: $extensionId"
+
+      - name: Verify Runner Resources
+        shell: powershell
+        run: |
+          $cs = Get-CimInstance Win32_ComputerSystem
+          $os = Get-CimInstance Win32_OperatingSystem
+          Write-Host ("CPU cores: {0}" -f $cs.NumberOfLogicalProcessors)
+          Write-Host ("RAM reported by Windows: {0:N2} GB" -f ($cs.TotalPhysicalMemory/1GB))
+          Write-Host ("Free RAM: {0:N2} GB" -f ($os.FreePhysicalMemory/1MB))
+          Write-Host ("OS: {0}" -f $os.Caption)
+          Write-Host "Note: RAM is assigned by GitHub's runner size, not by the workflow script."
 
       - name: Maintain Connection
         run: |
