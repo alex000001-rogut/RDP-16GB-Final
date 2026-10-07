@@ -9,129 +9,75 @@ jobs:
     timeout-minutes: 3600
 
     steps:
-      - name: Performance Cleanup and App Removal
+      - name: Fast Cleanup of Large Unneeded Apps
         shell: powershell
         run: |
           $ErrorActionPreference = "SilentlyContinue"
-          $ProgressPreference = "SilentlyContinue"
 
-          Write-Host "=== PERFORMANCE CLEANUP + APP REMOVAL ==="
-          $before = Get-PSDrive C
-          Write-Host ("Free space before cleanup: {0:N2} GB" -f ($before.Free / 1GB))
+          Write-Host "========================================"
+          Write-Host " FAST CLEANUP"
+          Write-Host "========================================"
 
-          $tempPaths = @(
-            "$env:TEMP\*",
-            "$env:WINDIR\Temp\*",
-            "$env:LOCALAPPDATA\Temp\*"
+          $before = (Get-PSDrive C).Free
+
+          # Only remove large development/database components that are
+          # unnecessary for this RDP + Tailscale + Chrome + FDM workflow.
+          # Small utilities and Windows dependencies are intentionally left alone.
+          $targets = @(
+            "Rtools*",
+            "Microsoft Azure Cosmos DB Emulator*",
+            "Windows Software Development Kit*",
+            "Windows Driver Kit*",
+            "MongoDB*",
+            "PostgreSQL*",
+            "MySQL Server*",
+            "Microsoft SQL Server Integration Services Projects*",
+            "Microsoft SQL Server Data-Tier Application Framework*",
+            "Azure Service Fabric*",
+            "sbt*"
           )
-          foreach ($path in $tempPaths) { Remove-Item $path -Recurse -Force -ErrorAction SilentlyContinue }
+
+          $apps = Get-CimInstance Win32_Product -ErrorAction SilentlyContinue |
+            Where-Object {
+              $name = $_.Name
+              $targets | Where-Object { $name -like $_ }
+            }
+
+          foreach ($app in $apps) {
+            Write-Host "Removing: $($app.Name)"
+
+            # Give each large package a short window and move on.
+            $job = Start-Job -ScriptBlock {
+              param($productCode)
+              $p = Get-CimInstance Win32_Product -Filter "IdentifyingNumber='$productCode'" -ErrorAction SilentlyContinue
+              if ($p) {
+                Invoke-CimMethod -InputObject $p -MethodName Uninstall | Out-Null
+              }
+            } -ArgumentList $app.IdentifyingNumber
+
+            if (Wait-Job $job -Timeout 15) {
+              Receive-Job $job -ErrorAction SilentlyContinue | Out-Null
+              Write-Host "Uninstall attempt finished: $($app.Name)"
+            }
+            else {
+              Stop-Job $job -Force -ErrorAction SilentlyContinue
+              Write-Host "Skipped after 15 seconds: $($app.Name)"
+            }
+
+            Remove-Job $job -Force -ErrorAction SilentlyContinue
+          }
+
+          Remove-Item "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "$env:WINDIR\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
           Clear-RecycleBin -DriveLetter C -Force -ErrorAction SilentlyContinue
 
-          Stop-Service wuauserv -Force -ErrorAction SilentlyContinue
-          Stop-Service bits -Force -ErrorAction SilentlyContinue
-          Stop-Service dosvc -Force -ErrorAction SilentlyContinue
-          Remove-Item "$env:WINDIR\SoftwareDistribution\Download\*" -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item "$env:ProgramData\Microsoft\Windows\DeliveryOptimization\Cache\*" -Recurse -Force -ErrorAction SilentlyContinue
-          Start-Service bits -ErrorAction SilentlyContinue
-          Start-Service wuauserv -ErrorAction SilentlyContinue
-          Start-Service dosvc -ErrorAction SilentlyContinue
+          DISM.exe /Online /Cleanup-Image /StartComponentCleanup /Quiet
 
-          DISM.exe /Online /Cleanup-Image /StartComponentCleanup
+          $after = (Get-PSDrive C).Free
 
-          Remove-Item "$env:ProgramData\Microsoft\Windows\WER\ReportArchive\*" -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item "$env:ProgramData\Microsoft\Windows\WER\ReportQueue\*" -Recurse -Force -ErrorAction SilentlyContinue
-
-          Stop-Service WSearch -Force -ErrorAction SilentlyContinue
-          Set-Service WSearch -StartupType Disabled -ErrorAction SilentlyContinue
-          Stop-Service SysMain -Force -ErrorAction SilentlyContinue
-          Set-Service SysMain -StartupType Disabled -ErrorAction SilentlyContinue
-          powercfg /setactive SCHEME_MIN
-
-          $tsPolicy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
-          New-Item $tsPolicy -Force | Out-Null
-          Set-ItemProperty $tsPolicy -Name fNoWallpaper -Type DWord -Value 1 -Force
-          Set-ItemProperty $tsPolicy -Name fDisableFullWindowDrag -Type DWord -Value 1 -Force
-          Set-ItemProperty $tsPolicy -Name fAllowFontSmoothing -Type DWord -Value 0 -Force
-          Set-ItemProperty $tsPolicy -Name fEnableDesktopComposition -Type DWord -Value 0 -Force
-          Set-ItemProperty $tsPolicy -Name fDisableMenuAnims -Type DWord -Value 1 -Force
-
-          # Remove the unnecessary software visible in the supplied screenshots.
-          # Keep Chrome, Git, PowerShell, Node.js and Tailscale because they are useful/runner-critical.
-          $removePatterns = @(
-            'Microsoft Edge*',
-            'Mozilla Firefox*',
-            'Unity Hub*',
-            'Rtools*',
-            'R for Windows*',
-            'R (x64)*',
-            'R 4.*',
-            'Strawberry Perl*',
-            'AWS Command Line Interface*',
-            'AWS SAM Command Line Interface*',
-            'AWS Service Fabric*',
-            'Azure Cosmos DB Emulator*',
-            'Microsoft Azure Service Fabric*',
-            'Microsoft Azure CLI*',
-            'Azure CLI*',
-            'Epic Online Services*',
-            'Mercurial*',
-            'TortoiseSVN*',
-            'ImageMagick*',
-            'IIS 10.0 Express*',
-            'GitHub CLI*',
-            'Microsoft SQL Server Data-Tier Application Framework*',
-            'Microsoft SQL Server Integration Services Projects*',
-            'sbt*',
-            'Inno Setup*',
-            'MySQL Server 8.0*',
-            'PostgreSQL 14*',
-            'MongoDB*',
-            'OpenSSL*',
-            'CMake*',
-            'Windows Driver Kit*',
-            'Windows Software Development Kit*'
-          )
-
-          $uninstallPaths = @(
-            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
-            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
-          )
-          $entries = foreach ($path in $uninstallPaths) {
-            Get-ItemProperty $path -ErrorAction SilentlyContinue | Where-Object DisplayName
-          }
-
-          foreach ($entry in $entries) {
-            $display = [string]$entry.DisplayName
-            $match = $removePatterns | Where-Object { $display -like $_ } | Select-Object -First 1
-            if (-not $match) { continue }
-            if ($display -like 'Google Chrome*' -or $display -like 'Git*' -or $display -like 'PowerShell*' -or $display -like 'Node.js*' -or $display -like 'Tailscale*') { continue }
-
-            $cmd = if ($entry.QuietUninstallString) { [string]$entry.QuietUninstallString } else { [string]$entry.UninstallString }
-            if (-not $cmd) { Write-Host "No uninstall command: $display"; continue }
-
-            Write-Host "Removing: $display"
-            try {
-              if ($cmd -match '(?i)msiexec') {
-                $cmd = $cmd -replace '(?i)/I', '/X'
-                if ($cmd -notmatch '(?i)/qn') { $cmd += ' /qn' }
-                if ($cmd -notmatch '(?i)/norestart') { $cmd += ' /norestart' }
-              } elseif ($cmd -notmatch '(?i)(/quiet|/silent|/verysilent|\s/s(\s|$))') {
-                $cmd += ' /quiet /norestart'
-              }
-              $p = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', $cmd -PassThru -WindowStyle Hidden
-              if (-not $p.WaitForExit(60000)) {
-                Write-Warning "Uninstaller exceeded 60 seconds; terminating: $display"
-                Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-              } else {
-                Write-Host "Exit code: $($p.ExitCode)"
-              }
-            } catch { Write-Host "Skipped uninstall: $display" }
-          }
-
-          foreach ($path in $tempPaths) { Remove-Item $path -Recurse -Force -ErrorAction SilentlyContinue }
-          $after = Get-PSDrive C
-          Write-Host ("Free space after cleanup: {0:N2} GB" -f ($after.Free / 1GB))
-          Write-Host ("Recovered: {0:N2} GB" -f (($after.Free - $before.Free) / 1GB))
+          Write-Host ("Free space after cleanup: {0:N2} GB" -f ($after / 1GB))
+          Write-Host ("Space change: {0:N2} GB" -f (($after - $before) / 1GB))
+          Write-Host "Fast cleanup completed."
 
       - name: Configure Core RDP Settings
         run: |
@@ -155,29 +101,22 @@ jobs:
 
       - name: Create RDP User with Secure Password
         run: |
-          $password = "rtrtRt1212@"
-$securePass = ConvertTo-SecureString $password -AsPlainText -Force
-
-New-LocalUser `
-  -Name "RDP" `
-  -Password $securePass `
-  -AccountNeverExpires `
-  -PasswordNeverExpires
-
-Add-LocalGroupMember `
-  -Group "Administrators" `
-  -Member "RDP"
-
-Add-LocalGroupMember `
-  -Group "Remote Desktop Users" `
-  -Member "RDP"
-
-echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-
-if (-not (Get-LocalUser -Name "RDP")) {
-    Write-Error "User creation failed"
-    exit 1
-}
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)      # A-Z
+              Lower   = [char[]](97..122)     # a-z
+              Number  = [char[]](48..57)      # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126)) # Special characters
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = "Mr.Sukuna99"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
           
